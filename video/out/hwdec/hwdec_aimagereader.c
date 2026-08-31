@@ -360,6 +360,9 @@ static void mapper_uninit(struct ra_hwdec_mapper *mapper)
     struct priv_owner *o = mapper->owner->priv;
     GL *gl = ra_gl_get(mapper->ra);
 
+    if (o->direct_surface)
+        return;
+
     o->AImageReader_setImageListener(o->reader, NULL);
 
     gl->DeleteTextures(1, &p->gl_texture);
