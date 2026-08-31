@@ -180,10 +180,20 @@ static int init(struct ra_hwdec *hw)
     else
         hw->glsl_extensions = es2_exts;
 
-    // dummy dimensions, AImageReader only transports hardware buffers
-    media_status_t ret = p->AImageReader_newWithUsage(16, 16,
-        AIMAGE_FORMAT_PRIVATE, AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE,
-        5, &p->reader);
+    // Dummy dimensions: AImageReader only transports hardware buffers.
+    const int32_t reader_width = 16;
+    const int32_t reader_height = 16;
+    const int32_t reader_format = AIMAGE_FORMAT_PRIVATE;
+    const uint64_t reader_usage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE;
+    const int32_t reader_max_images = 5;
+    MP_TRACE(hw,
+             "[dovi-diag] AImageReader config size=%dx%d format=%#x "
+             "usage=%#"PRIx64" max-images=%d\n",
+             reader_width, reader_height, reader_format, reader_usage,
+             reader_max_images);
+    media_status_t ret = p->AImageReader_newWithUsage(
+        reader_width, reader_height, reader_format, reader_usage,
+        reader_max_images, &p->reader);
     if (ret != AMEDIA_OK) {
         MP_ERR(hw, "newWithUsage failed: %d\n", ret);
         return -1;
@@ -389,7 +399,7 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
     mp_assert(hwbuf);
 
     // Update texture size since it may differ
-    AHardwareBuffer_Desc d;
+    AHardwareBuffer_Desc d = {0};
     o->AHardwareBuffer_describe(hwbuf, &d);
     p->image_serial++;
 
@@ -420,20 +430,15 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
     if (o->AImage_getCropRect)
         o->AImage_getCropRect(p->image, &crop);
 
-    MP_TRACE(mapper,
-             "[dovi-diag] AImage=%"PRIu64" ptr=%p timestamp=%"PRId64
-             " image=%dx%d format=%#x dataspace=%#x planes=%d "
-             "crop=%d,%d-%d,%d "
-             "AHB=%ux%u layers=%u format=%#x usage=%#"PRIx64
-             " stride=%u transform=identity texture=%dx%d\n",
-             p->image_serial, p->image, timestamp, image_width, image_height,
-             image_format, image_dataspace, plane_count, crop.left, crop.top,
-             crop.right, crop.bottom, d.width, d.height, d.layers, d.format,
-             d.usage, d.stride, mapper->tex[0]->params.w,
-             mapper->tex[0]->params.h);
-
-    if (plane_count > 0) {
-        for (int i = 0; i < plane_count; i++) {
+    int planes_to_log = plane_count;
+    if (planes_to_log < 0 || planes_to_log > 4) {
+        if (planes_to_log > 4)
+            MP_WARN(mapper, "[dovi-diag] invalid AImage plane count: %d\n",
+                    planes_to_log);
+        planes_to_log = 0;
+    }
+    if (planes_to_log > 0) {
+        for (int i = 0; i < planes_to_log; i++) {
             int32_t pixel_stride = -1;
             int32_t row_stride = -1;
             if (o->AImage_getPlanePixelStride)
@@ -451,6 +456,19 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
         mapper->tex[0]->params.w = d.width;
         mapper->tex[0]->params.h = d.height;
     }
+
+    MP_TRACE(mapper,
+             "[dovi-diag] AImage=%"PRIu64" ptr=%p timestamp=%"PRId64
+             " image=%dx%d format=%#x dataspace=%#x planes=%d "
+             "crop=%d,%d-%d,%d "
+             "AHB=%ux%u layers=%u format=%#x usage=%#"PRIx64
+             " stride=%u texture=%dx%d "
+             "transform=[1,0,0,0;0,1,0,0;0,0,1,0;0,0,0,1]\n",
+             p->image_serial, p->image, timestamp, image_width, image_height,
+             image_format, image_dataspace, plane_count, crop.left, crop.top,
+             crop.right, crop.bottom, d.width, d.height, d.layers, d.format,
+             d.usage, d.stride, mapper->tex[0]->params.w,
+             mapper->tex[0]->params.h);
 
     EGLClientBuffer buf = p->GetNativeClientBufferANDROID(hwbuf);
     if (!buf)
