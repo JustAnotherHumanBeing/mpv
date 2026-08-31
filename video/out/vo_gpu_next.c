@@ -29,6 +29,9 @@
 #include <libplacebo/utils/frame_queue.h>
 
 #include "config.h"
+#if HAVE_EGL_ANDROID
+#include <libavcodec/mediacodec.h>
+#endif
 #include "common/common.h"
 #include "common/stats.h"
 #include "misc/io_utils.h"
@@ -146,6 +149,8 @@ struct priv {
     bool frame_pending;
     bool paused;
 
+    struct mp_image *android_direct_image;
+
     pl_options pars;
     struct m_config_cache *opts_cache;
     struct m_config_cache *next_opts_cache;
@@ -173,6 +178,15 @@ struct priv {
 
 static void update_render_options(struct vo *vo);
 static void update_lut(struct priv *p, struct user_lut *lut);
+
+static bool use_android_dovi_overlay(struct vo *vo)
+{
+#if HAVE_EGL_ANDROID
+    return vo->opts->android_dovi_overlay;
+#else
+    return false;
+#endif
+}
 
 struct gl_next_opts {
     bool delayed_peak;
@@ -1244,6 +1258,16 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     pl_gpu gpu = p->gpu;
     update_options(vo);
 
+    bool direct_overlay = use_android_dovi_overlay(vo);
+    if (direct_overlay && frame->current && !frame->redraw && !frame->repeat) {
+        if (frame->current->imgfmt != IMGFMT_MEDIACODEC) {
+            MP_ERR(vo, "Android Dolby overlay requires MediaCodec frames\n");
+            return VO_FALSE;
+        }
+        mp_image_unrefp(&p->android_direct_image);
+        p->android_direct_image = mp_image_new_ref(frame->current);
+    }
+
     struct pl_render_params params = pars->params;
     const struct gl_video_opts *opts = p->opts_cache->opts;
     bool will_redraw = frame->display_synced && frame->num_vsyncs > 1;
@@ -1287,10 +1311,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
         }
     }
 
-    // Push all incoming frames into the frame queue
-    for (int n = 0; n < frame->num_frames; n++) {
-        int id = frame->frame_id + n;
-
+    // Direct-surface frames are presented by MediaCodec in flip_page(). The
+    // GPU swapchain is used only for the transparent OSD/subtitle layer.
+    if (direct_overlay) {
         if (p->want_reset) {
             pl_queue_reset(p->queue);
             p->last_pts = 0.0;
@@ -1298,30 +1321,47 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
             p->want_reset = false;
             p->flush_cache = true;
         }
-
         if (p->flush_cache) {
             pl_renderer_flush_cache(p->rr);
             p->flush_cache = false;
         }
+    } else {
+        // Push all incoming frames into the frame queue
+        for (int n = 0; n < frame->num_frames; n++) {
+            int id = frame->frame_id + n;
 
-        if (id <= p->last_id)
-            continue; // ignore already seen frames
+            if (p->want_reset) {
+                pl_queue_reset(p->queue);
+                p->last_pts = 0.0;
+                p->last_id = 0;
+                p->want_reset = false;
+                p->flush_cache = true;
+            }
 
-        struct mp_image *mpi = mp_image_new_ref(frame->frames[n]);
-        struct frame_priv *fp = talloc_zero(mpi, struct frame_priv);
-        mpi->priv = fp;
-        fp->vo = vo;
+            if (p->flush_cache) {
+                pl_renderer_flush_cache(p->rr);
+                p->flush_cache = false;
+            }
 
-        pl_queue_push(p->queue, &(struct pl_source_frame) {
-            .pts = mpi->pts,
-            .duration = can_interpolate ? frame->approx_duration : 0,
-            .frame_data = mpi,
-            .map = map_frame,
-            .unmap = unmap_frame,
-            .discard = discard_frame,
-        });
+            if (id <= p->last_id)
+                continue; // ignore already seen frames
 
-        p->last_id = id;
+            struct mp_image *mpi = mp_image_new_ref(frame->frames[n]);
+            struct frame_priv *fp = talloc_zero(mpi, struct frame_priv);
+            mpi->priv = fp;
+            fp->vo = vo;
+
+            pl_queue_push(p->queue, &(struct pl_source_frame) {
+                .pts = mpi->pts,
+                .duration = can_interpolate ? frame->approx_duration : 0,
+                .frame_data = mpi,
+                .map = map_frame,
+                .unmap = unmap_frame,
+                .discard = discard_frame,
+            });
+
+            p->last_id = id;
+        }
     }
 
     struct ra_swapchain *sw = p->ra_ctx->swapchain;
@@ -1673,8 +1713,12 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     // fall through
 
 done:
-    if (!valid) // clear with purple to indicate error
-        pl_tex_clear(gpu, swframe.fbo, (float[4]){ 0.5, 0.0, 1.0, 1.0 });
+    if (!valid) {
+        if (direct_overlay)
+            pl_tex_clear(gpu, swframe.fbo, (float[4]){ 0.0, 0.0, 0.0, 0.0 });
+        else // clear with purple to indicate error
+            pl_tex_clear(gpu, swframe.fbo, (float[4]){ 0.5, 0.0, 1.0, 1.0 });
+    }
 
     pl_gpu_flush(gpu);
     p->frame_pending = true;
@@ -1685,6 +1729,17 @@ static void flip_page(struct vo *vo)
 {
     struct priv *p = vo->priv;
     struct ra_swapchain *sw = p->ra_ctx->swapchain;
+
+#if HAVE_EGL_ANDROID
+    if (p->android_direct_image) {
+        AVMediaCodecBuffer *buffer =
+            (AVMediaCodecBuffer *)p->android_direct_image->planes[3];
+        int ret = av_mediacodec_release_buffer(buffer, 1);
+        if (ret < 0)
+            MP_ERR(vo, "Failed presenting direct MediaCodec frame: %d\n", ret);
+        mp_image_unrefp(&p->android_direct_image);
+    }
+#endif
 
     if (p->frame_pending) {
         if (!pl_swapchain_submit_frame(p->sw))
@@ -2056,7 +2111,7 @@ static void update_ra_ctx_options(struct vo *vo, struct ra_ctx_opts *ctx_opts)
     ctx_opts->want_alpha = (gl_opts->background == BACKGROUND_COLOR &&
                             gl_opts->background_color.a != 255) ||
                             gl_opts->background == BACKGROUND_NONE ||
-                            border_alpha;
+                            border_alpha || use_android_dovi_overlay(vo);
 }
 
 static int control(struct vo *vo, uint32_t request, void *data)
@@ -2349,6 +2404,8 @@ done:
 static void uninit(struct vo *vo)
 {
     struct priv *p = vo->priv;
+
+    mp_image_unrefp(&p->android_direct_image);
 
     // Drain any in-flight uploads.
     if (p->gpu)
@@ -2753,6 +2810,14 @@ static void update_render_options(struct vo *vo)
     };
     pars->params.background = map_background_types[opts->background];
     pars->params.border = map_background_types[p->next_opts->border_background];
+    if (use_android_dovi_overlay(vo)) {
+        pars->params.background_color[0] = 0.0f;
+        pars->params.background_color[1] = 0.0f;
+        pars->params.background_color[2] = 0.0f;
+        pars->params.background_transparency = 1.0f;
+        pars->params.background = PL_CLEAR_COLOR;
+        pars->params.border = PL_CLEAR_COLOR;
+    }
     pars->params.blur_radius = p->next_opts->background_blur_radius;
     pars->params.tile_size = opts->background_tile_size * 2;
     for (int i = 0; i < 2; ++i) {

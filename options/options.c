@@ -250,6 +250,8 @@ static const m_option_t mp_vo_opt_list[] = {
 #endif
 #if HAVE_EGL_ANDROID
     {"android-surface-size", OPT_SIZE_BOX(android_surface_size)},
+    {"android-video-wid", OPT_INT64(android_video_wid), .flags = UPDATE_VO},
+    {"android-dovi-overlay", OPT_BOOL(android_dovi_overlay), .flags = UPDATE_VO},
 #endif
 #if HAVE_D3D11
     {"d3d11-composition-size", OPT_SIZE_BOX(d3d11_composition_size)},

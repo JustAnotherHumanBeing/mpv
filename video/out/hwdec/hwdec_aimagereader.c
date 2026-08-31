@@ -39,6 +39,7 @@ typedef void *EGLImageKHR;
 
 struct priv_owner {
     struct mp_hwdec_ctx hwctx;
+    bool direct_surface;
     AImageReader *reader;
     jobject surface;
     void *lib_handle;
@@ -155,9 +156,35 @@ static bool load_lib_functions(struct priv_owner *p, struct mp_log *log)
 static int init(struct ra_hwdec *hw)
 {
     struct priv_owner *p = hw->priv;
+    struct vo *vo = hw->ra_ctx->vo;
 
     if (!ra_is_gl(hw->ra_ctx->ra))
         return -1;
+
+    if (vo->opts->android_dovi_overlay) {
+        int64_t wid = vo->opts->android_video_wid;
+        if (wid == 0 || wid == -1) {
+            MP_ERR(hw, "--android-dovi-overlay requires --android-video-wid\n");
+            return -1;
+        }
+
+        p->direct_surface = true;
+        p->hwctx = (struct mp_hwdec_ctx) {
+            .driver_name = hw->driver->name,
+            .av_device_ref = create_mediacodec_device_ref(
+                (jobject)(intptr_t)wid),
+            .hw_imgfmt = IMGFMT_MEDIACODEC,
+        };
+        if (!p->hwctx.av_device_ref) {
+            MP_ERR(hw, "Failed to create direct MediaCodec hwdevice\n");
+            return -1;
+        }
+
+        hwdec_devices_add(hw->devs, &p->hwctx);
+        MP_VERBOSE(hw, "Using direct MediaCodec video surface with GPU overlay\n");
+        return 0;
+    }
+
     if (!eglGetCurrentContext())
         return -1;
 
@@ -268,6 +295,9 @@ static int mapper_init(struct ra_hwdec_mapper *mapper)
     struct priv *p = mapper->priv;
     struct priv_owner *o = mapper->owner->priv;
     GL *gl = ra_gl_get(mapper->ra);
+
+    if (o->direct_surface)
+        return -1;
 
     p->log = mapper->log;
     mp_mutex_init(&p->lock);

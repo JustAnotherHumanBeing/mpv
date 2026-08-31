@@ -86,6 +86,8 @@ typedef struct mp_vo_opts {
     int video_sync;
 
     struct m_geometry android_surface_size;
+    int64_t android_video_wid;
+    bool android_dovi_overlay;
 
     struct m_geometry d3d11_composition_size;
 
