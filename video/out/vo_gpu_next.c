@@ -150,6 +150,7 @@ struct priv {
     bool paused;
 
     struct mp_image *android_direct_image;
+    bool android_direct_active;
 
     pl_options pars;
     struct m_config_cache *opts_cache;
@@ -1259,16 +1260,36 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     update_options(vo);
 
     bool direct_overlay = use_android_dovi_overlay(vo);
-    if (direct_overlay && frame->current && !frame->redraw && !frame->repeat) {
-        if (frame->current->imgfmt != IMGFMT_MEDIACODEC) {
-            MP_ERR(vo, "Android Dolby overlay requires MediaCodec frames\n");
-            return VO_FALSE;
+    if (frame->current) {
+        bool direct_active = direct_overlay &&
+                             frame->current->imgfmt == IMGFMT_MEDIACODEC;
+        if (direct_active != p->android_direct_active) {
+            MP_VERBOSE(vo, "Android direct video surface %s\n",
+                       direct_active ? "enabled" : "disabled");
+            p->android_direct_active = direct_active;
+            p->want_reset = true;
+            if (!direct_active)
+                mp_image_unrefp(&p->android_direct_image);
         }
+    } else if (!direct_overlay) {
+        p->android_direct_active = false;
+    }
+
+    bool direct_active = direct_overlay && p->android_direct_active;
+    if (direct_active && frame->current && !frame->redraw && !frame->repeat) {
         mp_image_unrefp(&p->android_direct_image);
         p->android_direct_image = mp_image_new_ref(frame->current);
     }
 
     struct pl_render_params params = pars->params;
+    if (direct_active) {
+        params.background_color[0] = 0.0f;
+        params.background_color[1] = 0.0f;
+        params.background_color[2] = 0.0f;
+        params.background_transparency = 1.0f;
+        params.background = PL_CLEAR_COLOR;
+        params.border = PL_CLEAR_COLOR;
+    }
     const struct gl_video_opts *opts = p->opts_cache->opts;
     bool will_redraw = frame->display_synced && frame->num_vsyncs > 1;
     bool cache_frame = will_redraw || frame->still || p->paused;
@@ -1313,7 +1334,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 
     // Direct-surface frames are presented by MediaCodec in flip_page(). The
     // GPU swapchain is used only for the transparent OSD/subtitle layer.
-    if (direct_overlay) {
+    if (direct_active) {
         if (p->want_reset) {
             pl_queue_reset(p->queue);
             p->last_pts = 0.0;
@@ -1714,7 +1735,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 
 done:
     if (!valid) {
-        if (direct_overlay)
+        if (direct_active)
             pl_tex_clear(gpu, swframe.fbo, (float[4]){ 0.0, 0.0, 0.0, 0.0 });
         else // clear with purple to indicate error
             pl_tex_clear(gpu, swframe.fbo, (float[4]){ 0.5, 0.0, 1.0, 1.0 });
@@ -2810,14 +2831,6 @@ static void update_render_options(struct vo *vo)
     };
     pars->params.background = map_background_types[opts->background];
     pars->params.border = map_background_types[p->next_opts->border_background];
-    if (use_android_dovi_overlay(vo)) {
-        pars->params.background_color[0] = 0.0f;
-        pars->params.background_color[1] = 0.0f;
-        pars->params.background_color[2] = 0.0f;
-        pars->params.background_transparency = 1.0f;
-        pars->params.background = PL_CLEAR_COLOR;
-        pars->params.border = PL_CLEAR_COLOR;
-    }
     pars->params.blur_radius = p->next_opts->background_blur_radius;
     pars->params.tile_size = opts->background_tile_size * 2;
     for (int i = 0; i < 2; ++i) {
