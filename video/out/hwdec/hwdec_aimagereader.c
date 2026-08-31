@@ -19,6 +19,7 @@
 
 #include <assert.h>
 #include <dlfcn.h>
+#include <inttypes.h>
 #include <EGL/egl.h>
 #include <media/NdkImageReader.h>
 #include <android/native_window_jni.h>
@@ -54,6 +55,17 @@ struct priv_owner {
     void (*AImage_delete)(AImage *);
     void (*AHardwareBuffer_describe)(const AHardwareBuffer *, AHardwareBuffer_Desc *);
     jobject (*ANativeWindow_toSurface)(JNIEnv *, ANativeWindow *);
+
+    media_status_t (*AImage_getWidth)(const AImage *, int32_t *);
+    media_status_t (*AImage_getHeight)(const AImage *, int32_t *);
+    media_status_t (*AImage_getFormat)(const AImage *, int32_t *);
+    media_status_t (*AImage_getTimestamp)(const AImage *, int64_t *);
+    media_status_t (*AImage_getDataSpace)(const AImage *, int32_t *);
+    media_status_t (*AImage_getNumberOfPlanes)(const AImage *, int32_t *);
+    media_status_t (*AImage_getPlanePixelStride)(const AImage *, int,
+                                                 int32_t *);
+    media_status_t (*AImage_getPlaneRowStride)(const AImage *, int, int32_t *);
+    media_status_t (*AImage_getCropRect)(const AImage *, AImageCropRect *);
 };
 
 struct priv {
@@ -66,6 +78,7 @@ struct priv {
     mp_mutex lock;
     mp_cond cond;
     bool image_available;
+    uint64_t image_serial;
 
     EGLImageKHR (EGLAPIENTRY *CreateImageKHR)(
         EGLDisplay, EGLContext, EGLenum, EGLClientBuffer, const EGLint *);
@@ -75,17 +88,30 @@ struct priv {
     void (EGLAPIENTRY *EGLImageTargetTexture2DOES)(GLenum, GLeglImageOES);
 };
 
-static const struct { const char *symbol; int offset; } lib_functions[] = {
-    { "AImageReader_newWithUsage", offsetof(struct priv_owner, AImageReader_newWithUsage) },
-    { "AImageReader_getWindow", offsetof(struct priv_owner, AImageReader_getWindow) },
-    { "AImageReader_setImageListener", offsetof(struct priv_owner, AImageReader_setImageListener) },
-    { "AImageReader_acquireLatestImage", offsetof(struct priv_owner, AImageReader_acquireLatestImage) },
-    { "AImageReader_delete", offsetof(struct priv_owner, AImageReader_delete) },
-    { "AImage_getHardwareBuffer", offsetof(struct priv_owner, AImage_getHardwareBuffer) },
-    { "AImage_delete", offsetof(struct priv_owner, AImage_delete) },
-    { "AHardwareBuffer_describe", offsetof(struct priv_owner, AHardwareBuffer_describe) },
-    { "ANativeWindow_toSurface", offsetof(struct priv_owner, ANativeWindow_toSurface) },
-    { NULL, 0 },
+static const struct {
+    const char *symbol;
+    int offset;
+    bool required;
+} lib_functions[] = {
+    { "AImageReader_newWithUsage", offsetof(struct priv_owner, AImageReader_newWithUsage), true },
+    { "AImageReader_getWindow", offsetof(struct priv_owner, AImageReader_getWindow), true },
+    { "AImageReader_setImageListener", offsetof(struct priv_owner, AImageReader_setImageListener), true },
+    { "AImageReader_acquireLatestImage", offsetof(struct priv_owner, AImageReader_acquireLatestImage), true },
+    { "AImageReader_delete", offsetof(struct priv_owner, AImageReader_delete), true },
+    { "AImage_getHardwareBuffer", offsetof(struct priv_owner, AImage_getHardwareBuffer), true },
+    { "AImage_delete", offsetof(struct priv_owner, AImage_delete), true },
+    { "AHardwareBuffer_describe", offsetof(struct priv_owner, AHardwareBuffer_describe), true },
+    { "ANativeWindow_toSurface", offsetof(struct priv_owner, ANativeWindow_toSurface), true },
+    { "AImage_getWidth", offsetof(struct priv_owner, AImage_getWidth), false },
+    { "AImage_getHeight", offsetof(struct priv_owner, AImage_getHeight), false },
+    { "AImage_getFormat", offsetof(struct priv_owner, AImage_getFormat), false },
+    { "AImage_getTimestamp", offsetof(struct priv_owner, AImage_getTimestamp), false },
+    { "AImage_getDataSpace", offsetof(struct priv_owner, AImage_getDataSpace), false },
+    { "AImage_getNumberOfPlanes", offsetof(struct priv_owner, AImage_getNumberOfPlanes), false },
+    { "AImage_getPlanePixelStride", offsetof(struct priv_owner, AImage_getPlanePixelStride), false },
+    { "AImage_getPlaneRowStride", offsetof(struct priv_owner, AImage_getPlaneRowStride), false },
+    { "AImage_getCropRect", offsetof(struct priv_owner, AImage_getCropRect), false },
+    { NULL, 0, false },
 };
 
 
@@ -115,12 +141,13 @@ static bool load_lib_functions(struct priv_owner *p, struct mp_log *log)
         void *fun = dlsym(p->lib_handle, sym);
         if (!fun)
             fun = dlsym(RTLD_DEFAULT, sym);
-        if (!fun) {
+        if (!fun && lib_functions[i].required) {
             mp_warn(log, "Could not resolve symbol %s\n", sym);
             return false;
         }
 
-        *(void **) ((uint8_t*)p + lib_functions[i].offset) = fun;
+        if (fun)
+            *(void **) ((uint8_t*)p + lib_functions[i].offset) = fun;
     }
     return true;
 }
@@ -364,6 +391,61 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
     // Update texture size since it may differ
     AHardwareBuffer_Desc d;
     o->AHardwareBuffer_describe(hwbuf, &d);
+    p->image_serial++;
+
+    int32_t image_width = -1;
+    int32_t image_height = -1;
+    int32_t image_format = -1;
+    int32_t image_dataspace = -1;
+    int32_t plane_count = -1;
+    int64_t timestamp = -1;
+    AImageCropRect crop = {
+        .left = -1,
+        .top = -1,
+        .right = -1,
+        .bottom = -1,
+    };
+    if (o->AImage_getWidth)
+        o->AImage_getWidth(p->image, &image_width);
+    if (o->AImage_getHeight)
+        o->AImage_getHeight(p->image, &image_height);
+    if (o->AImage_getFormat)
+        o->AImage_getFormat(p->image, &image_format);
+    if (o->AImage_getTimestamp)
+        o->AImage_getTimestamp(p->image, &timestamp);
+    if (o->AImage_getDataSpace)
+        o->AImage_getDataSpace(p->image, &image_dataspace);
+    if (o->AImage_getNumberOfPlanes)
+        o->AImage_getNumberOfPlanes(p->image, &plane_count);
+    if (o->AImage_getCropRect)
+        o->AImage_getCropRect(p->image, &crop);
+
+    MP_TRACE(mapper,
+             "[dovi-diag] AImage=%"PRIu64" ptr=%p timestamp=%"PRId64
+             " image=%dx%d format=%#x dataspace=%#x planes=%d "
+             "crop=%d,%d-%d,%d "
+             "AHB=%ux%u layers=%u format=%#x usage=%#"PRIx64
+             " stride=%u transform=identity texture=%dx%d\n",
+             p->image_serial, p->image, timestamp, image_width, image_height,
+             image_format, image_dataspace, plane_count, crop.left, crop.top,
+             crop.right, crop.bottom, d.width, d.height, d.layers, d.format,
+             d.usage, d.stride, mapper->tex[0]->params.w,
+             mapper->tex[0]->params.h);
+
+    if (plane_count > 0) {
+        for (int i = 0; i < plane_count; i++) {
+            int32_t pixel_stride = -1;
+            int32_t row_stride = -1;
+            if (o->AImage_getPlanePixelStride)
+                o->AImage_getPlanePixelStride(p->image, i, &pixel_stride);
+            if (o->AImage_getPlaneRowStride)
+                o->AImage_getPlaneRowStride(p->image, i, &row_stride);
+            MP_TRACE(mapper,
+                     "[dovi-diag] AImage=%"PRIu64
+                     " plane=%d pixel-stride=%d row-stride=%d\n",
+                     p->image_serial, i, pixel_stride, row_stride);
+        }
+    }
     if (mapper->tex[0]->params.w != d.width || mapper->tex[0]->params.h != d.height) {
         MP_VERBOSE(p, "Texture dimensions changed to %dx%d\n", d.width, d.height);
         mapper->tex[0]->params.w = d.width;
@@ -377,12 +459,23 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
     const int attribs[] = {EGL_NONE};
     p->egl_image = p->CreateImageKHR(eglGetCurrentDisplay(),
         EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, buf, attribs);
-    if (!p->egl_image)
+    if (!p->egl_image) {
+        MP_ERR(mapper, "[dovi-diag] eglCreateImageKHR failed: %#x\n",
+               eglGetError());
         return -1;
+    }
 
     gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, p->gl_texture);
     p->EGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, p->egl_image);
     gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+    if (mp_msg_test(mapper->log, MSGL_TRACE)) {
+        GLenum error = gl->GetError();
+        MP_TRACE(mapper,
+                 "[dovi-diag] AImage=%"PRIu64
+                 " EGLImage=%p GL texture=%u target=%#x error=%#x\n",
+                 p->image_serial, p->egl_image, p->gl_texture,
+                 GL_TEXTURE_EXTERNAL_OES, error);
+    }
 
     return 0;
 }

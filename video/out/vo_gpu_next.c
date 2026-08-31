@@ -479,6 +479,16 @@ struct frame_priv {
     struct pl_frame el_frame;
 };
 
+static size_t image_side_data_size(const struct mp_image *mpi,
+                                   enum AVFrameSideDataType type)
+{
+    for (int i = 0; i < mpi->num_ff_side_data; i++) {
+        if (mpi->ff_side_data[i].type == type)
+            return mpi->ff_side_data[i].buf->size;
+    }
+    return 0;
+}
+
 static int plane_data_from_imgfmt(struct pl_plane_data out_data[4],
                                   struct pl_bit_encoding *out_bits,
                                   enum mp_imgfmt imgfmt, bool use_uint)
@@ -877,6 +887,18 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
     }
 
     mp_image_params_guess_csp(&par);
+
+    const char *dovi_path = par.repr.dovi ? "dolby-vision-reshaping" :
+        pl_color_transfer_is_hdr(par.color.transfer) ? "ordinary-hdr" : "sdr";
+    MP_TRACE(vo,
+             "[dovi-diag] gpu-next input pts=%f params=%s hw-interop=%s "
+             "DOVI-mapped=%d DOVI-metadata=%zu DOVI-RPU=%zu path=%s\n",
+             mpi->pts, mp_image_params_to_str(&par),
+             fp->hwdec ? fp->hwdec->driver->name : "software",
+             !!par.repr.dovi,
+             image_side_data_size(mpi, AV_FRAME_DATA_DOVI_METADATA),
+             image_side_data_size(mpi, AV_FRAME_DATA_DOVI_RPU_BUFFER),
+             dovi_path);
 
     *frame = (struct pl_frame) {
         .color = par.color,

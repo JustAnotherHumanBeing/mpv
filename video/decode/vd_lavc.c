@@ -65,6 +65,13 @@ static enum AVPixelFormat get_format_hwdec(struct AVCodecContext *avctx,
 static int hwdec_opt_help(struct mp_log *log, const m_option_t *opt,
                           struct bstr name);
 
+static size_t frame_side_data_size(const AVFrame *frame,
+                                   enum AVFrameSideDataType type)
+{
+    AVFrameSideData *sd = av_frame_get_side_data(frame, type);
+    return sd ? sd->size : 0;
+}
+
 #define HWDEC_DELAY_QUEUE_COUNT 2
 #define HWDEC_WAIT_KEYFRAME_COUNT 96
 
@@ -1308,11 +1315,50 @@ static int decode_frame(struct mp_filter *vd)
     // data.
     mp_assert(ctx->pic->buf[0]);
 
+    const AVHWFramesContext *hwframes = ctx->pic->hw_frames_ctx ?
+        (const AVHWFramesContext *)ctx->pic->hw_frames_ctx->data : NULL;
+    MP_TRACE(vd,
+             "[dovi-diag] AVFrame pts=%"PRId64" best-effort=%"PRId64
+             " pkt-dts=%"PRId64" duration=%"PRId64" size=%dx%d "
+             "crop=%zu,%zu,%zu,%zu format=%s sw-format=%s "
+             "primaries=%s transfer=%s matrix=%s range=%s chroma=%s "
+             "DOVI-metadata=%zu DOVI-RPU=%zu decoder=%s hwdec=%s "
+             "interop=%s\n",
+             ctx->pic->pts, ctx->pic->best_effort_timestamp,
+             ctx->pic->pkt_dts, ctx->pic->duration,
+             ctx->pic->width, ctx->pic->height,
+             ctx->pic->crop_left, ctx->pic->crop_top,
+             ctx->pic->crop_right, ctx->pic->crop_bottom,
+             av_get_pix_fmt_name(ctx->pic->format) ?
+                 av_get_pix_fmt_name(ctx->pic->format) : "unknown",
+             hwframes && av_get_pix_fmt_name(hwframes->sw_format) ?
+                 av_get_pix_fmt_name(hwframes->sw_format) : "none",
+             av_color_primaries_name(ctx->pic->color_primaries) ?
+                 av_color_primaries_name(ctx->pic->color_primaries) : "unknown",
+             av_color_transfer_name(ctx->pic->color_trc) ?
+                 av_color_transfer_name(ctx->pic->color_trc) : "unknown",
+             av_color_space_name(ctx->pic->colorspace) ?
+                 av_color_space_name(ctx->pic->colorspace) : "unknown",
+             av_color_range_name(ctx->pic->color_range) ?
+                 av_color_range_name(ctx->pic->color_range) : "unknown",
+             av_chroma_location_name(ctx->pic->chroma_location) ?
+                 av_chroma_location_name(ctx->pic->chroma_location) : "unknown",
+             frame_side_data_size(ctx->pic, AV_FRAME_DATA_DOVI_METADATA),
+             frame_side_data_size(ctx->pic, AV_FRAME_DATA_DOVI_RPU_BUFFER),
+             avctx->codec ? avctx->codec->name : "unknown",
+             ctx->use_hwdec ? ctx->hwdec.name : "no",
+             ctx->use_hwdec ? ctx->hwdec.method_name : "software");
+
     struct mp_image *mpi = mp_image_from_av_frame(ctx->pic);
     if (!mpi) {
         av_frame_unref(ctx->pic);
         return ret;
     }
+
+    MP_TRACE(vd,
+             "[dovi-diag] mpv frame: %s DOVI-mapped=%d raw-side-data=%d\n",
+             mp_image_params_to_str(&mpi->params), !!mpi->dovi,
+             mpi->num_ff_side_data);
 
     if (mpi->imgfmt == IMGFMT_CUDA && !mpi->planes[0]) {
         MP_ERR(vd, "CUDA frame without data. This is a FFmpeg bug.\n");
