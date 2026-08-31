@@ -466,8 +466,8 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
     int planes_to_log = plane_count;
     if (planes_to_log < 0 || planes_to_log > 4) {
         if (planes_to_log > 4)
-            MP_WARN(mapper, "[dovi-diag] invalid AImage plane count: %d\n",
-                    planes_to_log);
+            MP_WARN(mapper, "[dovi-diag] invalid AImage plane count: %"PRId32"\n",
+                    plane_count);
         planes_to_log = 0;
     }
     if (planes_to_log > 0) {
@@ -480,25 +480,30 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
                 o->AImage_getPlaneRowStride(p->image, i, &row_stride);
             MP_TRACE(mapper,
                      "[dovi-diag] AImage=%"PRIu64
-                     " plane=%d pixel-stride=%d row-stride=%d\n",
+                     " plane=%d pixel-stride=%"PRId32
+                     " row-stride=%"PRId32"\n",
                      p->image_serial, i, pixel_stride, row_stride);
         }
     }
     if (mapper->tex[0]->params.w != d.width || mapper->tex[0]->params.h != d.height) {
-        MP_VERBOSE(p, "Texture dimensions changed to %dx%d\n", d.width, d.height);
+        MP_VERBOSE(p, "Texture dimensions changed to %"PRIu32"x%"PRIu32"\n",
+                   d.width, d.height);
         mapper->tex[0]->params.w = d.width;
         mapper->tex[0]->params.h = d.height;
     }
 
     MP_TRACE(mapper,
              "[dovi-diag] AImage=%"PRIu64" ptr=%p timestamp=%"PRId64
-             " image=%dx%d format=%#x dataspace=%#x planes=%d "
-             "crop=%d,%d-%d,%d "
-             "AHB=%ux%u layers=%u format=%#x usage=%#"PRIx64
-             " stride=%u texture=%dx%d "
+             " image=%"PRId32"x%"PRId32" format=%#"PRIx32
+             " dataspace=%#"PRIx32" planes=%"PRId32" "
+             "crop=%"PRId32",%"PRId32"-%"PRId32",%"PRId32" "
+             "AHB=%"PRIu32"x%"PRIu32" layers=%"PRIu32
+             " format=%#"PRIx32" usage=%#"PRIx64
+             " stride=%"PRIu32" texture=%dx%d "
              "transform=[1,0,0,0;0,1,0,0;0,0,1,0;0,0,0,1]\n",
-             p->image_serial, p->image, timestamp, image_width, image_height,
-             image_format, image_dataspace, plane_count, crop.left, crop.top,
+             p->image_serial, (void *)p->image, timestamp,
+             image_width, image_height, (uint32_t)image_format,
+             (uint32_t)image_dataspace, plane_count, crop.left, crop.top,
              crop.right, crop.bottom, d.width, d.height, d.layers, d.format,
              d.usage, d.stride, mapper->tex[0]->params.w,
              mapper->tex[0]->params.h);
