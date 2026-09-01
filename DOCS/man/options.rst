@@ -462,6 +462,13 @@ Playback Control
     directory). Prefixing the filename with ``./`` if it doesn't start with
     a ``/`` will avoid this.
 
+``--demuxer-dovi-split=<yes|no>``
+    Split interleaved Dolby Vision Profile 7 HEVC access units into a virtual
+    enhancement-layer track (default: yes). Set this to ``no`` when a hardware
+    Dolby Vision decoder must receive the original combined BL+EL+RPU access
+    units. Disabling the splitter does not remove enhancement-layer NAL units
+    from the primary stream.
+
 ``--loop-playlist=<N|inf|force|no>``, ``--loop-playlist``
     Loops playback ``N`` times. A value of ``1`` plays it one time (default),
     ``2`` two times, etc. ``inf`` means forever. ``no`` is the same as ``1`` and

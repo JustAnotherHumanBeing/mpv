@@ -51,6 +51,9 @@ static void mp_dovi_split_destructor(void *p)
 struct mp_dovi_split *mp_dovi_split_create(struct demuxer *demuxer,
                                            struct sh_stream *bl)
 {
+    if (!demuxer || !demuxer->opts || !demuxer->opts->dovi_split)
+        return NULL;
+
     if (!bl || bl->type != STREAM_VIDEO || !bl->codec ||
         !bl->codec->codec || strcmp(bl->codec->codec, "hevc") != 0)
         return NULL;
