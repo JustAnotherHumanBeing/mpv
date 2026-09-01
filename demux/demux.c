@@ -112,6 +112,7 @@ const struct m_sub_options demux_conf = {
         {"force-seekable", OPT_BOOL(force_seekable)},
         {"cache-secs", OPT_DOUBLE(min_secs_cache), M_RANGE(0, DBL_MAX)},
         {"access-references", OPT_BOOL(access_references)},
+        {"demuxer-dovi-merge", OPT_BOOL(dovi_merge)},
         {"demuxer-dovi-split", OPT_BOOL(dovi_split)},
         {"demuxer-seekable-cache", OPT_CHOICE(seekable_cache,
             {"auto", -1}, {"no", 0}, {"yes", 1})},

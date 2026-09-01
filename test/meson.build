@@ -96,6 +96,14 @@ test('json', json)
 linked_list = executable('linked-list', files('linked_list.c'), include_directories: incdir)
 test('linked-list', linked_list)
 
+dovi_merge_objects = libmpv.extract_objects('demux/dovi_merge.c')
+dovi_merge = executable('dovi-merge', 'dovi_merge.c',
+                        include_directories: incdir,
+                        dependencies: [libavcodec, libavutil],
+                        objects: dovi_merge_objects,
+                        link_with: test_utils)
+test('dovi-merge', dovi_merge)
+
 timer = executable('timer', files('timer.c'), include_directories: incdir, link_with: test_utils)
 test('timer', timer)
 

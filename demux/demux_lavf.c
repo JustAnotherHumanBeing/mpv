@@ -52,6 +52,7 @@
 #include "stream/stream_curl.h"
 
 #include "demux.h"
+#include "dovi_merge.h"
 #include "dovi_split.h"
 #include "stheader.h"
 #include "options/m_config.h"
@@ -226,6 +227,8 @@ struct stream_info {
     double last_key_pts;
     double highest_pts;
     double ts_offset;
+    struct mp_dovi_merge *dovi_merge; // Set only on the BL owner.
+    int dovi_merge_index;             // BL owner index, or -1.
     struct mp_dovi_split *dovi_split;
 };
 
@@ -611,6 +614,12 @@ static void select_tracks(struct demuxer *demuxer, int start)
             if (el && demux_stream_is_selected(el))
                 selected = true;
         }
+        int merge_index = priv->streams[n]->dovi_merge_index;
+        if (!selected && merge_index >= 0 && merge_index < priv->num_streams) {
+            struct sh_stream *bl = priv->streams[merge_index]->sh;
+            if (bl && demux_stream_is_selected(bl))
+                selected = true;
+        }
         st->discard = selected ? AVDISCARD_DEFAULT : AVDISCARD_ALL;
     }
 }
@@ -830,6 +839,7 @@ static void handle_new_stream(demuxer_t *demuxer, int i)
         .sh = sh,
         .last_key_pts = MP_NOPTS_VALUE,
         .highest_pts = MP_NOPTS_VALUE,
+        .dovi_merge_index = -1,
     };
     mp_assert(priv->num_streams == i); // directly mapped
     MP_TARRAY_APPEND(priv, priv->streams, priv->num_streams, info);
@@ -1280,6 +1290,164 @@ static void handle_lcevc_group(demuxer_t *demuxer, AVStreamGroup *stg)
 #endif
 
 #if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(62, 19, 100)
+static const AVPacketSideData *get_dovi_config(const AVCodecParameters *par)
+{
+    return par ? av_packet_side_data_get(par->coded_side_data,
+                                         par->nb_coded_side_data,
+                                         AV_PKT_DATA_DOVI_CONF) : NULL;
+}
+
+static int bdmv_dovi_level(AVFormatContext *avfc, AVStream *st)
+{
+    static const struct {
+        double max_pps;
+        int max_width;
+    } levels[] = {
+        [1] = {1280.0 * 720 * 24, 1280},
+        [2] = {1280.0 * 720 * 30, 1280},
+        [3] = {1920.0 * 1080 * 24, 1920},
+        [4] = {1920.0 * 1080 * 30, 2560},
+        [5] = {1920.0 * 1080 * 60, 3840},
+        [6] = {3840.0 * 2160 * 24, 3840},
+        [7] = {3840.0 * 2160 * 30, 3840},
+        [8] = {3840.0 * 2160 * 48, 3840},
+        [9] = {3840.0 * 2160 * 60, 3840},
+    };
+
+    if (st->codecpar->width <= 0 || st->codecpar->height <= 0 ||
+        st->codecpar->width > 3840 || st->codecpar->height > 2160)
+        return 0;
+
+    AVRational rate = av_guess_frame_rate(avfc, st, NULL);
+    double fps = rate.num > 0 && rate.den > 0 ? av_q2d(rate) : 60.0;
+    double pps = (double)st->codecpar->width * st->codecpar->height * fps;
+    for (int level = 1; level < MP_ARRAY_SIZE(levels); level++) {
+        if (st->codecpar->width <= levels[level].max_width &&
+            pps <= levels[level].max_pps * (1.0 + 1e-9))
+            return level;
+    }
+    return 0;
+}
+
+static bool configure_bdmv_dovi(struct demuxer *demuxer, AVStream *bl_st,
+                                AVStream *el_st, struct sh_stream *bl_sh)
+{
+    const AVPacketSideData *source = get_dovi_config(bl_st->codecpar);
+    if (!source)
+        source = get_dovi_config(el_st->codecpar);
+
+    AVDOVIDecoderConfigurationRecord config = {0};
+    if (source) {
+        if (source->size < sizeof(config)) {
+            MP_WARN(demuxer, "Dolby Vision M2TS: truncated configuration "
+                             "record.\n");
+            return false;
+        }
+        memcpy(&config, source->data, sizeof(config));
+        if (config.dv_profile != 7)
+            return false;
+    } else {
+        // UHD Blu-ray dual-PID Profile 7 omits the descriptor required by the
+        // Dolby MPEG-TS specification. Restrict synthesis to its fixed PIDs.
+        if (bl_st->id != 0x1011 || el_st->id != 0x1015)
+            return false;
+        config.dv_version_major = 1;
+        config.dv_version_minor = 0;
+        config.dv_profile = 7;
+        config.dv_bl_signal_compatibility_id = 6;
+        config.dv_md_compression = AV_DOVI_COMPRESSION_NONE;
+    }
+
+    int level = config.dv_level;
+    if (!level)
+        level = bdmv_dovi_level(demuxer->priv ?
+                                ((lavf_priv_t *)demuxer->priv)->avfc : NULL,
+                                bl_st);
+    if (!level) {
+        MP_WARN(demuxer, "Dolby Vision M2TS: unable to derive a valid Dolby "
+                         "Vision level for %dx%d.\n",
+                bl_st->codecpar->width, bl_st->codecpar->height);
+        return false;
+    }
+
+    config.dv_level = level;
+    config.bl_present_flag = 1;
+    config.el_present_flag = 1;
+    config.rpu_present_flag = 1;
+
+    AVCodecParameters *par = bl_sh->codec->lav_codecpar;
+    if (!par)
+        return false;
+    AVPacketSideData *dst = (AVPacketSideData *)get_dovi_config(par);
+    if (dst && dst->size >= sizeof(config)) {
+        memcpy(dst->data, &config, sizeof(config));
+    } else {
+        if (dst) {
+            av_packet_side_data_remove(par->coded_side_data,
+                                       &par->nb_coded_side_data,
+                                       AV_PKT_DATA_DOVI_CONF);
+        }
+        size_t config_size;
+        AVDOVIDecoderConfigurationRecord *owned = av_dovi_alloc(&config_size);
+        if (!owned || config_size < sizeof(config)) {
+            av_free(owned);
+            return false;
+        }
+        memcpy(owned, &config, sizeof(config));
+        if (!av_packet_side_data_add(&par->coded_side_data,
+                                     &par->nb_coded_side_data,
+                                     AV_PKT_DATA_DOVI_CONF,
+                                     (uint8_t *)owned, config_size, 0))
+        {
+            av_free(owned);
+            return false;
+        }
+    }
+
+    bl_sh->codec->dovi = true;
+    bl_sh->codec->dv_profile = config.dv_profile;
+    bl_sh->codec->dv_level = config.dv_level;
+    bl_sh->codec->dv_el_present = true;
+    return true;
+}
+
+static bool enable_dovi_merge(struct demuxer *demuxer, AVStream *bl_st,
+                              AVStream *el_st, struct sh_stream *bl_sh,
+                              struct sh_stream *el_sh)
+{
+    lavf_priv_t *priv = demuxer->priv;
+    if (!demuxer->opts->dovi_merge ||
+        !matches_avinputformat_name(priv, "mpegts") ||
+        bl_st->codecpar->codec_id != AV_CODEC_ID_HEVC ||
+        el_st->codecpar->codec_id != AV_CODEC_ID_HEVC)
+        return false;
+
+    struct stream_info *bl_info = priv->streams[bl_st->index];
+    struct stream_info *el_info = priv->streams[el_st->index];
+    if (bl_info->dovi_merge || bl_info->dovi_merge_index >= 0 ||
+        el_info->dovi_merge || el_info->dovi_merge_index >= 0)
+        return false;
+
+    struct mp_dovi_merge *merge =
+        mp_dovi_merge_create(priv, demuxer->log, bl_st->index, el_st->index,
+                             bl_st->time_base, el_st->time_base);
+    if (!merge)
+        return false;
+    if (!configure_bdmv_dovi(demuxer, bl_st, el_st, bl_sh)) {
+        talloc_free(merge);
+        return false;
+    }
+
+    bl_info->dovi_merge = merge;
+    bl_info->dovi_merge_index = bl_st->index;
+    el_info->dovi_merge_index = bl_st->index;
+    el_sh->dependent_track = true;
+    MP_INFO(demuxer, "Dolby Vision M2TS: merging BL PID %#x and EL PID %#x "
+                     "for one Profile 7 decoder (level %u).\n",
+            bl_st->id, el_st->id, (unsigned)bl_sh->codec->dv_level);
+    return true;
+}
+
 // Base layer + Enhancement layer separate track stream group
 static void handle_layered_video_group(demuxer_t *demuxer, AVStreamGroup *stg)
 {
@@ -1302,6 +1470,9 @@ static void handle_layered_video_group(demuxer_t *demuxer, AVStreamGroup *stg)
     struct sh_stream *el_sh = priv->streams[el_st->index]->sh;
     struct sh_stream *bl_sh = priv->streams[bl_st->index]->sh;
     if (!el_sh || !bl_sh)
+        return;
+
+    if (enable_dovi_merge(demuxer, bl_st, el_st, bl_sh, el_sh))
         return;
 
     // Group storage is attached to the BL so its lifetime tracks the demuxer.
@@ -1373,6 +1544,8 @@ static void detect_dovi_split_streams(demuxer_t *demuxer)
         {
             continue;
         }
+        if (info->dovi_merge_index >= 0)
+            continue;
         info->dovi_split = mp_dovi_split_create(demuxer, sh);
     }
 }
@@ -1658,10 +1831,17 @@ static bool demux_lavf_read_packet(struct demuxer *demux,
     MP_HANDLE_OOM(pkt);
     int r = av_read_frame(priv->avfc, pkt);
     update_read_stats(demux);
-    if (r < 0) {
+    if (r == AVERROR_EOF) {
         av_packet_free(&pkt);
-        if (r == AVERROR_EOF)
+        for (int n = 0; n < priv->num_streams && !pkt; n++) {
+            struct stream_info *candidate = priv->streams[n];
+            if (candidate && candidate->dovi_merge)
+                pkt = mp_dovi_merge_drain(candidate->dovi_merge);
+        }
+        if (!pkt)
             return false;
+    } else if (r < 0) {
+        av_packet_free(&pkt);
         if (demux_read_interrupted(demux)) {
             MP_VERBOSE(demux, "read interrupted: %s.\n", av_err2str(r));
             return false;
@@ -1673,8 +1853,9 @@ static bool demux_lavf_read_packet(struct demuxer *demux,
         }
         priv->retry_counter += 1;
         return true;
+    } else {
+        priv->retry_counter = 0;
     }
-    priv->retry_counter = 0;
 
     add_new_streams(demux);
     update_metadata(demux);
@@ -1683,6 +1864,27 @@ static bool demux_lavf_read_packet(struct demuxer *demux,
     struct stream_info *info = priv->streams[pkt->stream_index];
     struct sh_stream *stream = info->sh;
     AVStream *st = priv->avfc->streams[pkt->stream_index];
+
+    if (info->dovi_merge_index >= 0) {
+        int merge_index = info->dovi_merge_index;
+        mp_assert(merge_index < priv->num_streams);
+        struct stream_info *owner = priv->streams[merge_index];
+        mp_assert(owner && owner->dovi_merge && owner->sh);
+
+        if (!demux_stream_is_selected(owner->sh)) {
+            av_packet_free(&pkt);
+            return true;
+        }
+
+        pkt = mp_dovi_merge_push(owner->dovi_merge, pkt);
+        if (!pkt)
+            return true;
+
+        mp_assert(pkt->stream_index == merge_index);
+        info = owner;
+        stream = owner->sh;
+        st = priv->avfc->streams[merge_index];
+    }
 
     // Keep BL packets flowing to feed the Dolby Vision splitter when its
     // virtual EL is selected, even if the BL itself isn't selected. The
@@ -1772,11 +1974,13 @@ static bool demux_lavf_read_packet(struct demuxer *demux,
     return true;
 }
 
-static void reset_dovi_split_state(demuxer_t *demuxer)
+static void reset_dovi_state(demuxer_t *demuxer)
 {
     lavf_priv_t *priv = demuxer->priv;
     TA_FREEP(&priv->pending_pkt);
     for (int n = 0; n < priv->num_streams; n++) {
+        if (priv->streams[n] && priv->streams[n]->dovi_merge)
+            mp_dovi_merge_reset(priv->streams[n]->dovi_merge);
         if (priv->streams[n] && priv->streams[n]->dovi_split)
             mp_dovi_split_reset(priv->streams[n]->dovi_split);
     }
@@ -1790,7 +1994,7 @@ static void demux_drop_buffers_lavf(demuxer_t *demuxer)
     stream_drop_buffers(priv->stream);
     avio_flush(priv->avfc->pb);
     avformat_flush(priv->avfc);
-    reset_dovi_split_state(demuxer);
+    reset_dovi_state(demuxer);
 }
 
 static void demux_seek_lavf(demuxer_t *demuxer, double seek_pts, int flags)
@@ -1874,13 +2078,14 @@ static void demux_seek_lavf(demuxer_t *demuxer, double seek_pts, int flags)
         av_strerror(r, buf, sizeof(buf));
         MP_VERBOSE(demuxer, "Seek failed (%s)\n", buf);
     }
-    reset_dovi_split_state(demuxer);
+    reset_dovi_state(demuxer);
 
     update_read_stats(demuxer);
 }
 
 static void demux_lavf_switched_tracks(struct demuxer *demuxer)
 {
+    reset_dovi_state(demuxer);
     select_tracks(demuxer, 0);
 }
 
@@ -1908,6 +2113,7 @@ static void demux_close_lavf(demuxer_t *demuxer)
             struct stream_info *info = priv->streams[n];
             if (info->sh)
                 avcodec_parameters_free(&info->sh->codec->lav_codecpar);
+            TA_FREEP(&info->dovi_merge);
             TA_FREEP(&info->dovi_split);
         }
         TA_FREEP(&priv->pending_pkt);

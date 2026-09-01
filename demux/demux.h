@@ -75,6 +75,7 @@ struct demux_opts {
     bool force_seekable;
     double min_secs_cache;
     bool access_references;
+    bool dovi_merge;
     bool dovi_split;
     int seekable_cache;
     int index_mode;

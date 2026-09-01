@@ -469,6 +469,14 @@ Playback Control
     units. Disabling the splitter does not remove enhancement-layer NAL units
     from the primary stream.
 
+``--demuxer-dovi-merge=<yes|no>``
+    Merge separate base- and enhancement-layer HEVC streams from a dual-PID
+    Dolby Vision Profile 7 UHD Blu-ray transport stream into combined
+    BL+EL+RPU access units (default: no). This is intended for hardware
+    decoders which accept single-track Profile 7 but cannot open independent
+    BL and EL decoders on the same output surface. The option is restricted to
+    stream groups identified as Dolby Vision by FFmpeg's MPEG-TS demuxer.
+
 ``--loop-playlist=<N|inf|force|no>``, ``--loop-playlist``
     Loops playback ``N`` times. A value of ``1`` plays it one time (default),
     ``2`` two times, etc. ``inf`` means forever. ``no`` is the same as ``1`` and
