@@ -1829,6 +1829,7 @@ static bool demux_lavf_read_packet(struct demuxer *demux,
 
     AVPacket *pkt = av_packet_alloc();
     MP_HANDLE_OOM(pkt);
+    bool dovi_drained = false;
     int r = av_read_frame(priv->avfc, pkt);
     update_read_stats(demux);
     if (r == AVERROR_EOF) {
@@ -1840,6 +1841,8 @@ static bool demux_lavf_read_packet(struct demuxer *demux,
         }
         if (!pkt)
             return false;
+        dovi_drained = true;
+        priv->retry_counter = 0;
     } else if (r < 0) {
         av_packet_free(&pkt);
         if (demux_read_interrupted(demux)) {
@@ -1865,7 +1868,9 @@ static bool demux_lavf_read_packet(struct demuxer *demux,
     struct sh_stream *stream = info->sh;
     AVStream *st = priv->avfc->streams[pkt->stream_index];
 
-    if (info->dovi_merge_index >= 0) {
+    // A packet returned by mp_dovi_merge_drain() has already passed through
+    // the merger. Re-queueing it here would prevent EOF from ever draining.
+    if (!dovi_drained && info->dovi_merge_index >= 0) {
         int merge_index = info->dovi_merge_index;
         mp_assert(merge_index < priv->num_streams);
         struct stream_info *owner = priv->streams[merge_index];

@@ -207,13 +207,14 @@ static AVPacket *merge_packets(struct mp_dovi_merge *s, AVPacket *bl,
     size_t extra = 0;
     unsigned wrapped_nals = 0;
     unsigned rpu_nals = 0;
-    if (bl->size < 0 || el->size <= 0 ||
+    if (bl->size <= 0 || el->size <= 0 ||
         !measure_el(el, &extra, &wrapped_nals, &rpu_nals) ||
         !add_size(&extra, bl->size))
     {
         if (!s->warned_malformed) {
-            MP_WARN(s, "Dolby Vision M2TS: malformed or oversized EL access "
-                       "unit; passing the corresponding base layer alone.\n");
+            MP_WARN(s, "Dolby Vision M2TS: malformed or oversized base or "
+                       "enhancement-layer access unit; passing the "
+                       "corresponding base layer alone.\n");
             s->warned_malformed = true;
         }
         av_packet_free(&el);

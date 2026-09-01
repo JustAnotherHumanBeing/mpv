@@ -23,7 +23,8 @@ static AVPacket *make_packet(int stream, int64_t pts,
     AVPacket *pkt = av_packet_alloc();
     assert_true(pkt);
     assert_int_equal(av_new_packet(pkt, size), 0);
-    memcpy(pkt->data, data, size);
+    if (size)
+        memcpy(pkt->data, data, size);
     pkt->stream_index = stream;
     pkt->pts = pts;
     pkt->dts = pts;
@@ -137,12 +138,53 @@ static void test_mismatch_and_malformed_fallback(void *ta_ctx)
     assert_true(!mp_dovi_merge_drain(m));
 }
 
+static void test_empty_base_layer_fallback(void *ta_ctx)
+{
+    static const uint8_t el_data[] = {
+        0x00, 0x00, 0x01, 0x02, 0x01, 0x80,
+        0x00, 0x00, 0x01, 0x7c, 0x01, 0x01,
+    };
+    struct mp_dovi_merge *m =
+        mp_dovi_merge_create(ta_ctx, NULL, 0, 1,
+                             (AVRational){1, 1}, (AVRational){1, 1});
+    assert_true(m);
+
+    AVPacket *bl = make_packet(0, 50, NULL, 0);
+    assert_true(!mp_dovi_merge_push(m, bl));
+    AVPacket *out = mp_dovi_merge_push(m,
+        make_packet(1, 50, el_data, sizeof(el_data)));
+    assert_true(out == bl);
+    assert_int_equal(out->size, 0);
+    av_packet_free(&out);
+    assert_true(!mp_dovi_merge_drain(m));
+}
+
+static void test_eof_drain_once(void *ta_ctx)
+{
+    static const uint8_t bl_data[] = {
+        0x00, 0x00, 0x01, 0x02, 0x01, 0x80,
+    };
+    struct mp_dovi_merge *m =
+        mp_dovi_merge_create(ta_ctx, NULL, 0, 1,
+                             (AVRational){1, 1}, (AVRational){1, 1});
+    assert_true(m);
+
+    AVPacket *bl = make_packet(0, 60, bl_data, sizeof(bl_data));
+    assert_true(!mp_dovi_merge_push(m, bl));
+    AVPacket *out = mp_dovi_merge_drain(m);
+    assert_true(out == bl);
+    av_packet_free(&out);
+    assert_true(!mp_dovi_merge_drain(m));
+}
+
 int main(void)
 {
     void *ta_ctx = talloc_new(NULL);
     test_wrapping(ta_ctx);
     test_reverse_and_missing_timestamps(ta_ctx);
     test_mismatch_and_malformed_fallback(ta_ctx);
+    test_empty_base_layer_fallback(ta_ctx);
+    test_eof_drain_once(ta_ctx);
     talloc_free(ta_ctx);
     return 0;
 }
