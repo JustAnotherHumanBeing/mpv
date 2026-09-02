@@ -163,8 +163,9 @@ static int init(struct ra_hwdec *hw)
 
     if (vo->opts->android_dovi_overlay) {
         int64_t wid = vo->opts->android_video_wid;
-        if (wid == 0 || wid == -1) {
-            MP_ERR(hw, "--android-dovi-overlay requires --android-video-wid\n");
+        if (wid <= 0 || (uint64_t)wid > UINTPTR_MAX) {
+            MP_ERR(hw, "--android-dovi-overlay requires a valid "
+                       "--android-video-wid\n");
             return -1;
         }
 
@@ -172,7 +173,7 @@ static int init(struct ra_hwdec *hw)
         p->hwctx = (struct mp_hwdec_ctx) {
             .driver_name = hw->driver->name,
             .av_device_ref = create_mediacodec_device_ref(
-                (jobject)(intptr_t)wid),
+                (jobject)(uintptr_t)wid),
             .hw_imgfmt = IMGFMT_MEDIACODEC,
         };
         if (!p->hwctx.av_device_ref) {
