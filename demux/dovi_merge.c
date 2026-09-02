@@ -313,17 +313,24 @@ static bool packet_times_match(struct mp_dovi_merge *s, const AVPacket *bl,
     return true;
 }
 
-static int packet_time_order(struct mp_dovi_merge *s, const AVPacket *bl,
-                             const AVPacket *el)
+static struct packet_node *find_matching_packet(struct mp_dovi_merge *s,
+                                                struct packet_queue *q,
+                                                const AVPacket *bl)
 {
-    // Keep the comparison priority identical to packet_times_match(). If PTS
-    // differs while DTS happens to match, pairing by DTS would combine two
-    // different presentation frames.
-    if (bl->pts != AV_NOPTS_VALUE && el->pts != AV_NOPTS_VALUE)
-        return av_compare_ts(bl->pts, s->bl_tb, el->pts, s->el_tb);
-    if (bl->dts != AV_NOPTS_VALUE && el->dts != AV_NOPTS_VALUE)
-        return av_compare_ts(bl->dts, s->bl_tb, el->dts, s->el_tb);
-    return 0;
+    for (struct packet_node *node = q->head; node; node = node->next) {
+        if (packet_times_match(s, bl, node->pkt))
+            return node;
+    }
+    return NULL;
+}
+
+static void discard_before(struct packet_queue *q,
+                           const struct packet_node *target)
+{
+    while (q->head && q->head != target) {
+        AVPacket *pkt = queue_pop(q);
+        av_packet_free(&pkt);
+    }
 }
 
 static size_t queued_bytes(const struct mp_dovi_merge *s)
@@ -337,27 +344,30 @@ static AVPacket *produce_packet(struct mp_dovi_merge *s)
 {
     while (s->bl.head && s->el.head) {
         AVPacket *bl = s->bl.head->pkt;
-        AVPacket *el = s->el.head->pkt;
-        if (packet_times_match(s, bl, el)) {
+        struct packet_node *matching_el =
+            find_matching_packet(s, &s->el, bl);
+        if (matching_el) {
+            discard_before(&s->el, matching_el);
             bl = queue_pop(&s->bl);
-            el = queue_pop(&s->el);
+            AVPacket *el = queue_pop(&s->el);
             return merge_packets(s, bl, el);
         }
 
-        int order = packet_time_order(s, bl, el);
-        if (order < 0)
-            return queue_pop(&s->bl);
-        if (order > 0) {
-            el = queue_pop(&s->el);
-            av_packet_free(&el);
-            continue;
+        // PTS is presentation ordered, not decode ordered. Do not infer that
+        // either head is stale merely because its PTS compares lower. A match
+        // for a later BL does prove that this earlier BL lost its EL, because
+        // libavformat preserves packet order within each elementary stream.
+        bool later_bl_matches = false;
+        for (struct packet_node *node = s->bl.head->next;
+             node && !later_bl_matches; node = node->next)
+        {
+            later_bl_matches =
+                find_matching_packet(s, &s->el, node->pkt) != NULL;
         }
+        if (later_bl_matches)
+            return queue_pop(&s->bl);
 
-        // No comparable timestamps remain. Pair in FIFO order rather than
-        // allowing an unbounded queue.
-        bl = queue_pop(&s->bl);
-        el = queue_pop(&s->el);
-        return merge_packets(s, bl, el);
+        break;
     }
 
     size_t total = queued_bytes(s);

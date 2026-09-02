@@ -123,15 +123,53 @@ static void test_pts_precedes_dts_for_pairing(void *ta_ctx)
         make_packet_ts(0, 10, 5, bl_data, sizeof(bl_data))));
     AVPacket *out = mp_dovi_merge_push(m,
         make_packet_ts(1, 20, 5, el_data, sizeof(el_data)));
+    assert_true(!out);
+
+    out = mp_dovi_merge_push(m,
+        make_packet_ts(0, 20, 6, bl_data, sizeof(bl_data)));
     assert_true(out);
     assert_int_equal(out->pts, 10);
     assert_int_equal(out->size, sizeof(bl_data));
     av_packet_free(&out);
 
-    out = mp_dovi_merge_push(m,
-        make_packet_ts(0, 20, 6, bl_data, sizeof(bl_data)));
+    out = mp_dovi_merge_drain(m);
     assert_true(out);
     assert_int_equal(out->pts, 20);
+    assert_true(out->size > sizeof(bl_data));
+    av_packet_free(&out);
+    assert_true(!mp_dovi_merge_drain(m));
+}
+
+static void test_missing_el_with_reordered_pts(void *ta_ctx)
+{
+    static const uint8_t bl_data[] = {
+        0x00, 0x00, 0x01, 0x02, 0x01, 0x80,
+    };
+    static const uint8_t el_data[] = {
+        0x00, 0x00, 0x01, 0x02, 0x01, 0x80,
+        0x00, 0x00, 0x01, 0x7c, 0x01, 0x01,
+    };
+    struct mp_dovi_merge *m =
+        mp_dovi_merge_create(ta_ctx, NULL, 0, 1,
+                             (AVRational){1, 1}, (AVRational){1, 1});
+    assert_true(m);
+
+    // Decode order is PTS 3, then PTS 1. The EL for PTS 3 is missing. A
+    // numerical PTS comparison would incorrectly discard the valid PTS 1 EL.
+    assert_true(!mp_dovi_merge_push(m,
+        make_packet_ts(0, 3, 0, bl_data, sizeof(bl_data))));
+    assert_true(!mp_dovi_merge_push(m,
+        make_packet_ts(0, 1, 1, bl_data, sizeof(bl_data))));
+    AVPacket *out = mp_dovi_merge_push(m,
+        make_packet_ts(1, 1, 1, el_data, sizeof(el_data)));
+    assert_true(out);
+    assert_int_equal(out->pts, 3);
+    assert_int_equal(out->size, sizeof(bl_data));
+    av_packet_free(&out);
+
+    out = mp_dovi_merge_drain(m);
+    assert_true(out);
+    assert_int_equal(out->pts, 1);
     assert_true(out->size > sizeof(bl_data));
     av_packet_free(&out);
     assert_true(!mp_dovi_merge_drain(m));
@@ -187,6 +225,9 @@ static void test_mismatch_and_malformed_fallback(void *ta_ctx)
         make_packet(0, 10, bl_data, sizeof(bl_data))));
     AVPacket *out = mp_dovi_merge_push(m,
         make_packet(1, 20, el_data, sizeof(el_data)));
+    assert_true(!out);
+
+    out = mp_dovi_merge_drain(m);
     assert_true(out);
     assert_int_equal(out->pts, 10);
     assert_int_equal(out->size, sizeof(bl_data));
@@ -315,6 +356,7 @@ int main(void)
     test_wrapping(ta_ctx);
     test_reverse_and_missing_timestamps(ta_ctx);
     test_pts_precedes_dts_for_pairing(ta_ctx);
+    test_missing_el_with_reordered_pts(ta_ctx);
     test_annexb_zero_bytes(ta_ctx);
     test_mismatch_and_malformed_fallback(ta_ctx);
     test_empty_base_layer_fallback(ta_ctx);
