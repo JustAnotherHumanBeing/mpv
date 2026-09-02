@@ -91,7 +91,7 @@ struct priv {
 
 static const struct {
     const char *symbol;
-    int offset;
+    size_t offset;
     bool required;
 } lib_functions[] = {
     { "AImageReader_newWithUsage", offsetof(struct priv_owner, AImageReader_newWithUsage), true },
