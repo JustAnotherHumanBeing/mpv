@@ -116,6 +116,12 @@ static bool annexb_next(struct annexb_iter *it, struct annexb_nal *nal)
     size_t data_end = has_next ? next_start : it->size;
     it->next = has_next ? next_start : it->size;
 
+    // Annex B permits zero_byte and trailing_zero_8bits around start-code
+    // prefixes. A run longer than the selected three- or four-byte prefix
+    // belongs to neither adjacent NAL unit.
+    while (data_end > data_start && it->data[data_end - 1] == 0)
+        data_end--;
+
     if (data_end - data_start < 2) {
         it->invalid = true;
         return false;
@@ -256,6 +262,10 @@ static AVPacket *merge_packets(struct mp_dovi_merge *s, AVPacket *bl,
 
 static bool queue_push(struct packet_queue *q, AVPacket *pkt)
 {
+    size_t packet_bytes = pkt->size > 0 ? (size_t)pkt->size : 0;
+    if (packet_bytes > SIZE_MAX - q->bytes)
+        return false;
+
     struct packet_node *node = av_mallocz(sizeof(*node));
     if (!node)
         return false;
@@ -266,8 +276,7 @@ static bool queue_push(struct packet_queue *q, AVPacket *pkt)
         q->head = node;
     q->tail = node;
     q->count++;
-    if (pkt->size > 0)
-        q->bytes += pkt->size;
+    q->bytes += packet_bytes;
     return true;
 }
 
@@ -307,11 +316,21 @@ static bool packet_times_match(struct mp_dovi_merge *s, const AVPacket *bl,
 static int packet_time_order(struct mp_dovi_merge *s, const AVPacket *bl,
                              const AVPacket *el)
 {
-    if (bl->dts != AV_NOPTS_VALUE && el->dts != AV_NOPTS_VALUE)
-        return av_compare_ts(bl->dts, s->bl_tb, el->dts, s->el_tb);
+    // Keep the comparison priority identical to packet_times_match(). If PTS
+    // differs while DTS happens to match, pairing by DTS would combine two
+    // different presentation frames.
     if (bl->pts != AV_NOPTS_VALUE && el->pts != AV_NOPTS_VALUE)
         return av_compare_ts(bl->pts, s->bl_tb, el->pts, s->el_tb);
+    if (bl->dts != AV_NOPTS_VALUE && el->dts != AV_NOPTS_VALUE)
+        return av_compare_ts(bl->dts, s->bl_tb, el->dts, s->el_tb);
     return 0;
+}
+
+static size_t queued_bytes(const struct mp_dovi_merge *s)
+{
+    if (s->el.bytes > SIZE_MAX - s->bl.bytes)
+        return SIZE_MAX;
+    return s->bl.bytes + s->el.bytes;
 }
 
 static AVPacket *produce_packet(struct mp_dovi_merge *s)
@@ -341,7 +360,7 @@ static AVPacket *produce_packet(struct mp_dovi_merge *s)
         return merge_packets(s, bl, el);
     }
 
-    size_t total = s->bl.bytes + s->el.bytes;
+    size_t total = queued_bytes(s);
     if (s->bl.count > DOVI_MERGE_MAX_PENDING ||
         (total > DOVI_MERGE_MAX_BYTES && s->bl.head))
     {
@@ -354,7 +373,7 @@ static AVPacket *produce_packet(struct mp_dovi_merge *s)
     }
 
     while (s->el.count > DOVI_MERGE_MAX_PENDING ||
-           s->bl.bytes + s->el.bytes > DOVI_MERGE_MAX_BYTES)
+           queued_bytes(s) > DOVI_MERGE_MAX_BYTES)
     {
         AVPacket *el = queue_pop(&s->el);
         if (!el)

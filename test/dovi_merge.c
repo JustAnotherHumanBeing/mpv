@@ -34,6 +34,14 @@ static AVPacket *make_packet(int stream, int64_t pts,
     return pkt;
 }
 
+static AVPacket *make_packet_ts(int stream, int64_t pts, int64_t dts,
+                                const uint8_t *data, size_t size)
+{
+    AVPacket *pkt = make_packet(stream, pts, data, size);
+    pkt->dts = dts;
+    return pkt;
+}
+
 static void test_wrapping(void *ta_ctx)
 {
     static const uint8_t bl_data[] = {
@@ -94,6 +102,69 @@ static void test_reverse_and_missing_timestamps(void *ta_ctx)
     assert_true(out);
     assert_int_equal(out->stream_index, 4);
     assert_int_equal(out->pts, AV_NOPTS_VALUE);
+    av_packet_free(&out);
+}
+
+static void test_pts_precedes_dts_for_pairing(void *ta_ctx)
+{
+    static const uint8_t bl_data[] = {
+        0x00, 0x00, 0x01, 0x02, 0x01, 0x80,
+    };
+    static const uint8_t el_data[] = {
+        0x00, 0x00, 0x01, 0x02, 0x01, 0x80,
+        0x00, 0x00, 0x01, 0x7c, 0x01, 0x01,
+    };
+    struct mp_dovi_merge *m =
+        mp_dovi_merge_create(ta_ctx, NULL, 0, 1,
+                             (AVRational){1, 1}, (AVRational){1, 1});
+    assert_true(m);
+
+    assert_true(!mp_dovi_merge_push(m,
+        make_packet_ts(0, 10, 5, bl_data, sizeof(bl_data))));
+    AVPacket *out = mp_dovi_merge_push(m,
+        make_packet_ts(1, 20, 5, el_data, sizeof(el_data)));
+    assert_true(out);
+    assert_int_equal(out->pts, 10);
+    assert_int_equal(out->size, sizeof(bl_data));
+    av_packet_free(&out);
+
+    out = mp_dovi_merge_push(m,
+        make_packet_ts(0, 20, 6, bl_data, sizeof(bl_data)));
+    assert_true(out);
+    assert_int_equal(out->pts, 20);
+    assert_true(out->size > sizeof(bl_data));
+    av_packet_free(&out);
+    assert_true(!mp_dovi_merge_drain(m));
+}
+
+static void test_annexb_zero_bytes(void *ta_ctx)
+{
+    static const uint8_t bl_data[] = {
+        0x00, 0x00, 0x01, 0x02, 0x01, 0x80,
+    };
+    static const uint8_t el_data[] = {
+        0x00, 0x00, 0x00, 0x01, 0x02, 0x01, 0xaa,
+        0x00, 0x00,
+        0x00, 0x00, 0x00, 0x01, 0x7c, 0x01, 0xcc,
+        0x00, 0x00,
+    };
+    static const uint8_t expected[] = {
+        0x00, 0x00, 0x01, 0x02, 0x01, 0x80,
+        0x00, 0x00, 0x00, 0x01, 0x7e, 0x01, 0x02, 0x01, 0xaa,
+        0x00, 0x00, 0x00, 0x01, 0x7c, 0x01, 0xcc,
+    };
+    struct mp_dovi_merge *m =
+        mp_dovi_merge_create(ta_ctx, NULL, 0, 1,
+                             (AVRational){1, 1}, (AVRational){1, 1});
+    assert_true(m);
+
+    assert_true(!mp_dovi_merge_push(m,
+        make_packet(0, 1, bl_data, sizeof(bl_data))));
+    AVPacket *out = mp_dovi_merge_push(m,
+        make_packet(1, 1, el_data, sizeof(el_data)));
+    assert_true(out);
+    assert_int_equal(out->size, sizeof(expected));
+    assert_memcmp(out->data, expected, sizeof(expected));
     av_packet_free(&out);
 }
 
@@ -177,14 +248,79 @@ static void test_eof_drain_once(void *ta_ctx)
     assert_true(!mp_dovi_merge_drain(m));
 }
 
+static void test_queue_pressure(void *ta_ctx)
+{
+    static const uint8_t bl_data[] = {
+        0x00, 0x00, 0x01, 0x02, 0x01, 0x80,
+    };
+    struct mp_dovi_merge *m =
+        mp_dovi_merge_create(ta_ctx, NULL, 0, 1,
+                             (AVRational){1, 1}, (AVRational){1, 1});
+    assert_true(m);
+
+    for (int n = 0; n < 16; n++) {
+        assert_true(!mp_dovi_merge_push(m,
+            make_packet(0, n, bl_data, sizeof(bl_data))));
+    }
+    AVPacket *out = mp_dovi_merge_push(m,
+        make_packet(0, 16, bl_data, sizeof(bl_data)));
+    assert_true(out);
+    assert_int_equal(out->pts, 0);
+    av_packet_free(&out);
+
+    for (int n = 1; n <= 16; n++) {
+        out = mp_dovi_merge_drain(m);
+        assert_true(out);
+        assert_int_equal(out->pts, n);
+        av_packet_free(&out);
+    }
+    assert_true(!mp_dovi_merge_drain(m));
+}
+
+static void test_malformed_input_sweep(void *ta_ctx)
+{
+    uint32_t state = 0x8b8b8b8b;
+    uint8_t data[256];
+    static const uint8_t bl_data[] = {
+        0x00, 0x00, 0x01, 0x02, 0x01, 0x80,
+    };
+    struct mp_dovi_merge *m =
+        mp_dovi_merge_create(ta_ctx, NULL, 0, 1,
+                             (AVRational){1, 1}, (AVRational){1, 1});
+    assert_true(m);
+
+    for (int n = 0; n < 2048; n++) {
+        state = state * 1664525U + 1013904223U;
+        size_t size = state % sizeof(data);
+        for (size_t i = 0; i < size; i++) {
+            state = state * 1664525U + 1013904223U;
+            data[i] = state >> 24;
+        }
+
+        assert_true(!mp_dovi_merge_push(m,
+            make_packet(0, n, bl_data, sizeof(bl_data))));
+        AVPacket *out = mp_dovi_merge_push(m,
+            make_packet(1, n, data, size));
+        assert_true(out);
+        assert_int_equal(out->stream_index, 0);
+        assert_true(out->size >= 0);
+        av_packet_free(&out);
+    }
+    assert_true(!mp_dovi_merge_drain(m));
+}
+
 int main(void)
 {
     void *ta_ctx = talloc_new(NULL);
     test_wrapping(ta_ctx);
     test_reverse_and_missing_timestamps(ta_ctx);
+    test_pts_precedes_dts_for_pairing(ta_ctx);
+    test_annexb_zero_bytes(ta_ctx);
     test_mismatch_and_malformed_fallback(ta_ctx);
     test_empty_base_layer_fallback(ta_ctx);
     test_eof_drain_once(ta_ctx);
+    test_queue_pressure(ta_ctx);
+    test_malformed_input_sweep(ta_ctx);
     talloc_free(ta_ctx);
     return 0;
 }
